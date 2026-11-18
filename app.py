@@ -1,477 +1,394 @@
-"""
-미국 ETF 성과 및 분산투자 대시보드 (app.py)
-
-Twelve Data 수집 데이터(data/etf_prices.csv)를 기반으로
-레버리지 ETF의 장기 성과 특성과 다자산 분산투자 효과를 시각화합니다.
-"""
-
-import numpy as np
+import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import streamlit as st
+from pathlib import Path
 
-# ==============================================================================
-# 1. 데이터 로딩 및 전처리
-# ==============================================================================
+# 페이지 기본 설정 (와이드 모드, 장식용 이모지 제거)
+st.set_page_config(layout="wide", page_title="ETF 자산배분 및 레버리지 대시보드")
 
 @st.cache_data
-def load_data() -> pd.DataFrame:
-    """
-    data/etf_prices.csv를 읽고 종가 피벗 테이블을 생성합니다.
-    - datetime을 날짜 형식으로 변환
-    - symbol을 컬럼으로 하고 close를 값으로 하는 피벗 테이블 반환
-    """
-    df = pd.read_csv("data/etf_prices.csv")
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    pivot_df = df.pivot(index="datetime", columns="symbol", values="close").sort_index()
+def load_data():
+    """CSV 데이터를 로드하고, 날짜 타입을 변환한 뒤 종가 피벗 테이블을 생성합니다."""
+    # 스크립트 파일 위치를 기준으로 경로를 잡는다. 어느 폴더에서 실행해도 같은 파일을 가리킨다.
+    df = pd.read_csv(Path(__file__).parent / "data" / "etf_prices.csv")
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    # datetime을 index로, symbol을 column으로 하는 피벗 테이블 생성
+    pivot_df = df.pivot(index='datetime', columns='symbol', values='close')
     return pivot_df
 
+# 데이터 로딩
+try:
+    prices_data = load_data()
+except Exception as e:
+    st.error(f"데이터 파일을 불러오는 데 실패했습니다: {e}")
+    st.stop()
 
-# ==============================================================================
-# 2. 공통 계산 함수 (화면 UI와 분리)
-# ==============================================================================
+# ==========================================
+# 1. 금융 성과 분석용 계산 함수 정의
+# ==========================================
 
-def calc_metrics(series: pd.Series, start_dt: pd.Timestamp, end_dt: pd.Timestamp):
-    """
-    단일 가격 시계열로부터 핵심 4대 지표를 계산합니다.
-    - 총수익률: 마지막 종가 / 첫 종가 - 1
-    - CAGR: (1 + 총수익률) ** (1 / 연수) - 1 (연수 = 실제 경과일수 / 365.25)
-    - 연변동성: 일간수익률 표준편차 * sqrt(252)
-    - 최대낙폭(MDD): 종가 / 누적 최고 종가 - 1 의 최솟값
-    """
-    first_val = series.iloc[0]
-    last_val = series.iloc[-1]
-    total_return = (last_val / first_val) - 1.0
+def calc_total_return(prices):
+    """주어진 가격 시계열의 총수익률을 계산합니다."""
+    return (prices.iloc[-1] / prices.iloc[0]) - 1
 
-    days = (end_dt - start_dt).days
-    years = days / 365.25
-    if years > 0 and (1.0 + total_return) > 0:
-        cagr = (1.0 + total_return) ** (1.0 / years) - 1.0
-    else:
-        cagr = 0.0
+def calc_cagr(prices):
+    """주어진 가격 시계열의 연환산 수익률(CAGR)을 계산합니다. 연수 = 경과일수 / 365.25"""
+    total_ret = calc_total_return(prices)
+    years = (prices.index[-1] - prices.index[0]).days / 365.25
+    if years <= 0:
+        return 0.0
+    return ((1 + total_ret) ** (1 / years)) - 1
 
-    daily_returns = series.pct_change().dropna()
-    volatility = daily_returns.std() * np.sqrt(252)
+def calc_volatility(prices):
+    """주어진 가격 시계열의 일간 수익률을 구한 후, 연변동성을 계산합니다. (std * sqrt(252))"""
+    daily_ret = prices.pct_change().dropna()
+    return daily_ret.std(ddof=1) * (252 ** 0.5)
 
-    cummax = series.cummax()
-    drawdown = (series / cummax) - 1.0
-    mdd = drawdown.min()
+def calc_mdd(prices):
+    """주어진 가격 시계열의 최대낙폭(MDD)을 계산합니다."""
+    cummax = prices.cummax()
+    drawdown = (prices / cummax) - 1
+    return drawdown.min()
 
-    return {
-        "total_return": total_return,
-        "cagr": cagr,
-        "volatility": volatility,
-        "mdd": mdd,
-    }
+# ==========================================
+# 2. 사이드바 (사이드바는 두 탭이 공동으로 설정값을 읽어 감)
+# ==========================================
+st.sidebar.header("설정 및 분석 기간")
 
+min_date = prices_data.index.min().date()
+max_date = prices_data.index.max().date()
 
-def calc_drawdown_series(series: pd.Series) -> pd.Series:
-    """
-    가격 시계열의 누적 최고점 대비 낙폭(%) 시계열을 계산합니다.
-    """
-    cummax = series.cummax()
-    return ((series / cummax) - 1.0) * 100.0
+# 분석 기간 입력
+start_date = st.sidebar.date_input("분석 시작일", value=pd.to_datetime("2021-08-23").date(), min_value=min_date, max_value=max_date)
+end_date = st.sidebar.date_input("분석 종료일", value=pd.to_datetime("2026-08-20").date(), min_value=min_date, max_value=max_date)
 
+# 배당 미포함 한계 상시 안내문구 (사이드바 하단 노출)
+st.sidebar.markdown("---")
+st.sidebar.warning("주의: 종가 기준 가격 수익률이며 배당은 포함되지 않았습니다. 실제 성과와 다릅니다.")
 
-def calc_portfolio_series(daily_ret: pd.DataFrame, spy_weight: float, first_date: pd.Timestamp) -> pd.Series:
-    """
-    SPY와 GLD의 일일 리밸런싱 포트폴리오 가격 시계열을 생성합니다 (첫날 기준 100).
-    """
-    w_spy = spy_weight / 100.0
-    w_gld = 1.0 - w_spy
-    port_ret = w_spy * daily_ret["SPY"] + w_gld * daily_ret["GLD"]
-    port_cum = (1.0 + port_ret).cumprod() * 100.0
-    # 첫날 100 추가
-    port_series = pd.concat([pd.Series([100.0], index=[first_date]), port_cum])
-    return port_series
+# 날짜 예외처리 및 데이터 슬라이싱
+if start_date >= end_date:
+    st.error("오류: 분석 시작일은 종료일보다 빨라야 합니다. 날짜 설정을 확인해 주세요.")
+    st.stop()
 
+# Pandas datetime 타입으로 매칭하기 위해 캐스팅
+sliced_prices = prices_data.loc[pd.Timestamp(start_date):pd.Timestamp(end_date)]
+total_days = (sliced_prices.index[-1] - sliced_prices.index[0]).days
 
-# ==============================================================================
-# 3. 사이드바 렌더링
-# ==============================================================================
+# 영업일수(데이터 행수)가 60일 미만인 경우 경고문 표시
+if len(sliced_prices) < 60:
+    st.sidebar.warning("경고: 선택된 구간이 짧아(60영업일 미만) 연환산 지표가 불안정할 수 있습니다.")
 
-def render_sidebar(pivot_df: pd.DataFrame):
-    """
-    사이드바 위젯을 렌더링하고 필터링된 데이터프레임을 반환합니다.
-    """
-    st.sidebar.header("분석 기간 설정")
+# 메인 헤더
+st.title("ETF 투자 교육 대시보드")
 
-    min_date = pivot_df.index.min().date()
-    max_date = pivot_df.index.max().date()
+# 탭 생성
+tab1, tab2 = st.tabs(["레버리지의 함정", "분산투자의 힘"])
 
-    start_date = st.sidebar.date_input("시작일", value=min_date, min_value=min_date, max_value=max_date)
-    end_date = st.sidebar.date_input("종료일", value=max_date, min_value=min_date, max_value=max_date)
-
-    # 유효성 검사 1: 시작일이 종료일보다 늦은 경우
-    if start_date > end_date:
-        st.sidebar.error("시작일은 종료일보다 이전이어야 합니다.")
-        st.stop()
-
-    filtered_df = pivot_df.loc[str(start_date):str(end_date)]
-
-    # 유효성 검사 2: 데이터 건수 확인
-    if len(filtered_df) < 2:
-        st.sidebar.error("선택한 기간에 충분한 데이터가 없습니다.")
-        st.stop()
-
-    # 유효성 검사 3: 60영업일 미만 경고
-    if len(filtered_df) < 60:
-        st.sidebar.warning("구간이 짧아 연환산 지표가 불안정합니다.")
-
-    st.sidebar.markdown("---")
-    # 배당 미포함 주의 문구 (접거나 숨기지 않고 상시 표시)
-    st.sidebar.info("주의: 종가 기준 가격 수익률이며 배당은 포함되지 않았습니다. 실제 성과와 다릅니다.")
-
-    return filtered_df, start_date, end_date
-
-
-# ==============================================================================
-# 4. 탭 1 — 레버리지의 함정
-# ==============================================================================
-
-def render_tab1_leverage(filtered_df: pd.DataFrame, start_dt: pd.Timestamp, end_dt: pd.Timestamp):
-    """
-    탭 1: QQQ(1배), QLD(2배), TQQQ(3배)의 누적 성과, 낙폭, 요약표, 원금 회복 계산기 등을 표시합니다.
-    """
-    symbols = ["QQQ", "QLD", "TQQQ"]
-    sub_df = filtered_df[symbols]
-
-    st.header("레버리지의 함정: 3배 레버리지는 3배 벌어주지 않는다")
-    st.caption("비교 대상: QQQ (나스닥100 1배), QLD (나스닥100 2배), TQQQ (나스닥100 3배)")
-
-    # 4-1. 누적 성과 곡선 & 4-3. 낙폭 시계열 그래프 (2단 컬럼 배치)
-    col_chart1, col_chart2 = st.columns(2)
-
-    with col_chart1:
-        st.subheader("누적 성과 곡선 (첫날 = 100)")
-        is_log = st.checkbox("세로축 로그 스케일", value=False)
-        
-        # 첫날 기준 100으로 정규화
-        norm_df = (sub_df / sub_df.iloc[0]) * 100.0
-        fig_perf = px.line(
-            norm_df,
-            x=norm_df.index,
-            y=symbols,
-            labels={"datetime": "날짜", "value": "정규화 가격 (첫날=100)", "symbol": "종목"},
-            color_discrete_map={"QQQ": "#1f77b4", "QLD": "#ff7f0e", "TQQQ": "#d62728"}
-        )
-        fig_perf.update_layout(
-            yaxis_type="log" if is_log else "linear",
-            hovermode="x unified",
-            margin=dict(l=20, r=20, t=30, b=20),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-        )
-        st.plotly_chart(fig_perf, use_container_width=True)
-
-    with col_chart2:
-        st.subheader("낙폭 (고점 대비 하락률)")
-        st.caption("성과가 좋아 보여도 깊은 낙폭을 견디지 못하면 손실이 확정됩니다.")
-        
-        dd_df = pd.DataFrame(index=sub_df.index)
-        for s in symbols:
-            dd_df[s] = calc_drawdown_series(sub_df[s])
-
-        fig_dd = px.line(
-            dd_df,
-            x=dd_df.index,
-            y=symbols,
-            labels={"datetime": "날짜", "value": "낙폭 (%)", "symbol": "종목"},
-            color_discrete_map={"QQQ": "#1f77b4", "QLD": "#ff7f0e", "TQQQ": "#d62728"}
-        )
-        fig_dd.update_layout(
-            hovermode="x unified",
-            margin=dict(l=20, r=20, t=30, b=20),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-        )
-        fig_dd.update_yaxes(ticksuffix="%")
-        st.plotly_chart(fig_dd, use_container_width=True)
-
-    st.markdown("---")
-
-    # 4-2. 성과 요약표
-    st.subheader("성과 요약표")
-    summary_data = []
-    metrics_cache = {}
-    for s in symbols:
-        m = calc_metrics(sub_df[s], start_dt, end_dt)
-        metrics_cache[s] = m
-        summary_data.append({
-            "종목": s,
-            "총수익률": f"{m['total_return'] * 100:+.1f}%",
-            "연환산수익률(CAGR)": f"{m['cagr'] * 100:.1f}%",
-            "연변동성": f"{m['volatility'] * 100:.1f}%",
-            "최대낙폭(MDD)": f"{m['mdd'] * 100:.1f}%"
-        })
-    summary_df = pd.DataFrame(summary_data)
-    st.table(summary_df.set_index("종목"))
-
-    st.caption("• 총수익률: 선택 기간 첫날 종가 대비 마지막 종가의 총 가격 변동률")
-    st.caption("• 연환산수익률(CAGR): 실제 경과일수(365.25일 기준)를 반영한 연평균 복리 수익률")
-    st.caption("• 연변동성: 일간수익률 표준편차에 252영업일 제곱근을 곱한 연간 가격 변동폭")
-    st.caption("• 최대낙폭(MDD): 투자 기간 중 고점 대비 얼마나 빠졌는가를 나타내는 최대 하락률")
-
-    st.markdown("---")
-
-    # 4-4. 원금 회복 계산기 & 4-5. 동적 메시지 (2단 컬럼)
-    col_calc, col_msg = st.columns(2)
-
-    with col_calc:
-        st.subheader("원금 회복 계산기")
-        st.caption("하락폭이 커질수록 원금 회복에 필요한 상승률은 기하급수적으로 커집니다.")
-        loss_pct = st.slider("하락률 선택 (%)", min_value=0, max_value=90, value=50, step=5)
-        
-        loss_val = loss_pct / 100.0
-        req_gain = (1.0 / (1.0 - loss_val) - 1.0) * 100.0 if loss_val < 1.0 else 0.0
-
-        st.metric(label="원금 회복에 필요한 상승률", value=f"+{req_gain:.1f}%")
-        st.write("-50% 하락은 +100% 상승이 있어야 원금입니다. 하락과 상승은 대칭이 아닙니다.")
-
-    with col_msg:
-        st.subheader("선택 기간 핵심 분석")
-        days = (end_dt - start_dt).days
-        years = days / 365.25
-        
-        tqqq_tr = metrics_cache["TQQQ"]["total_return"] * 100.0
-        qqq_tr = metrics_cache["QQQ"]["total_return"] * 100.0
-        tqqq_mdd = metrics_cache["TQQQ"]["mdd"] * 100.0
-        
-        # 수익률 배수 계산 (0 나눔 방지)
-        ratio_str = f"{(tqqq_tr / qqq_tr):.1f}배" if qqq_tr != 0 else "산출 불가"
-
-        s_str = start_dt.strftime("%Y-%m-%d")
-        e_str = end_dt.strftime("%Y-%m-%d")
-
-        info_text = (
-            f"{s_str} ~ {e_str} 구간에서 TQQQ(3배)는 {tqqq_tr:+.1f}%, QQQ(1배)는 {qqq_tr:+.1f}%였습니다.\n\n"
-            f"배수는 3배지만 {years:.1f}년 수익률 차이는 {ratio_str}에 그쳤습니다.\n\n"
-            f"그동안 TQQQ의 최대낙폭은 {tqqq_mdd:.1f}%였습니다."
-        )
-        st.info(info_text)
-
-        # 4-6. 시작일 변경 유도 문구
-        st.markdown(
-            "**안내:** 사이드바에서 분석 시작일을 **2023-01-03**으로 바꿔 보십시오. 결론이 뒤집힙니다."
-        )
-
-
-# ==============================================================================
-# 5. 탭 2 — 분산투자의 힘
-# ==============================================================================
-
-def render_tab2_diversification(filtered_df: pd.DataFrame, start_dt: pd.Timestamp, end_dt: pd.Timestamp):
-    """
-    탭 2: 7종목 상관계수, SPY/GLD 배분 실험, 비중별 위험-수익 산점도, 자산군 성과 비교를 표시합니다.
-    """
-    all_symbols = ["QQQ", "QLD", "TQQQ", "SPY", "VTI", "SCHD", "GLD"]
-    daily_ret = filtered_df[all_symbols].pct_change().dropna()
-
-    st.header("분산투자의 힘: 섞으면 덜 흔들린다")
-
-    # 5-1. 상관계수 히트맵 & 5-2. 히트맵 해석
-    st.subheader("1. 7종목 일간수익률 상관계수 행렬")
+# ==========================================
+# 3. 탭 1 — 레버리지의 함정
+# ==========================================
+with tab1:
+    st.header("레버리지 ETF의 장기 투자 위험성 분석")
     
-    corr_matrix = daily_ret.corr()
-
-    col_hmap, col_desc = st.columns([1.2, 0.8])
-
-    with col_hmap:
-        fig_corr = px.imshow(
-            corr_matrix,
-            text_auto=".2f",
-            aspect="auto",
-            color_continuous_scale="RdBu_r",
-            zmin=-1.0,
-            zmax=1.0,
-            labels=dict(color="상관계수")
+    # 탭 1의 분석 대상: QQQ, QLD, TQQQ 고정
+    lev_symbols = ["QQQ", "QLD", "TQQQ"]
+    lev_prices = sliced_prices[lev_symbols]
+    
+    # 3-1. 정규화 가격 곡선 계산 (첫 거래일 = 100 기준)
+    normalized_prices = (lev_prices / lev_prices.iloc[0]) * 100
+    
+    # 로그 스케일 토글 위젯
+    use_log_scale = st.checkbox("로그 스케일 세로축 사용", value=False, key="log_scale_tab1")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("누적 성과 곡선 (시작점 = 100)")
+        fig_perf = px.line(
+            normalized_prices, 
+            x=normalized_prices.index, 
+            y=lev_symbols,
+            labels={"value": "정규화 지수 (Base 100)", "datetime": "날짜"},
+            log_y=use_log_scale
         )
-        fig_corr.update_layout(
-            margin=dict(l=20, r=20, t=20, b=20),
-            height=380
+        fig_perf.update_layout(legend_title_text="심볼", margin=dict(l=20, r=20, t=20, b=20))
+        st.plotly_chart(fig_perf, width='stretch')
+        
+    with col2:
+        st.subheader("고점 대비 낙폭 (Drawdown) 시계열")
+        # 낙폭 계산
+        drawdowns = pd.DataFrame()
+        for sym in lev_symbols:
+            cummax = lev_prices[sym].cummax()
+            drawdowns[sym] = (lev_prices[sym] / cummax) - 1
+            
+        fig_dd = px.line(
+            drawdowns * 100, 
+            x=drawdowns.index, 
+            y=lev_symbols,
+            labels={"value": "낙폭 (%)", "datetime": "날짜"}
         )
-        st.plotly_chart(fig_corr, use_container_width=True)
+        fig_dd.update_layout(legend_title_text="심볼", margin=dict(l=20, r=20, t=20, b=20))
+        st.plotly_chart(fig_dd, width='stretch')
 
-    with col_desc:
-        st.markdown("#### 상관계수 해석 포인트")
-        spy_vti = corr_matrix.loc["SPY", "VTI"]
-        qqq_tqqq = corr_matrix.loc["QQQ", "TQQQ"]
-        gld_spy = corr_matrix.loc["GLD", "SPY"]
-        gld_schd = corr_matrix.loc["GLD", "SCHD"]
+    # 3-2. 성과 요약표 계산 및 표시
+    st.subheader("선택 기간 성과 요약 비교")
+    summary_list = []
+    for sym in lev_symbols:
+        tot_ret = calc_total_return(lev_prices[sym])
+        cagr_val = calc_cagr(lev_prices[sym])
+        vol_val = calc_volatility(lev_prices[sym])
+        mdd_val = calc_mdd(lev_prices[sym])
+        
+        summary_list.append({
+            "심볼": sym,
+            "총수익률": f"{tot_ret*100:+.1f}%",
+            "연환산수익률(CAGR)": f"{cagr_val*100:.1f}%",
+            "연변동성": f"{vol_val*100:.1f}%",
+            "최대낙폭(MDD)": f"{mdd_val*100:.1f}%"
+        })
+    st.table(pd.DataFrame(summary_list))
+    st.markdown("""
+    * **총수익률**: 분석 기간 동안 자산 가격의 단순 누적 상승/하락률입니다.
+    * **연환산수익률(CAGR)**: 기하평균을 기준으로 매년 자산이 복리로 몇 %씩 성장했는지 나타내는 비율입니다.
+    * **연변동성**: 일일 수익률의 표준편차를 연간 영업일(252일) 기준으로 환산하여 자산 가격의 흔들림 정도를 뜻합니다.
+    * **최대낙폭(MDD)**: 분석 기간 중 직전 역사적 고점 대비 자산이 가장 크게 폭락했을 때의 하락률(고점 대비 낙폭의 최솟값)입니다.
+    """)
 
-        st.write(
-            f"1. **SPY와 VTI의 상관계수는 {spy_vti:.2f}입니다.**\n"
-            f"   상관이 1에 매우 가까우므로 두 종목을 함께 담는 것은 분산이 아닙니다."
+    # 3-4. 원금 회복 계산기
+    st.subheader("원금 회복 계산기 (하락과 상승의 비대칭성)")
+    loss_pct = st.slider("가상의 계좌 하락률 (%)", min_value=0, max_value=90, value=50, step=5)
+    loss_ratio = loss_pct / 100.0
+    required_gain = (1.0 / (1.0 - loss_ratio) - 1.0) * 100.0 if loss_ratio < 1.0 else float('inf')
+    
+    st.metric(label="원금 회복에 필요한 요구 상승률", value=f"{required_gain:+.1f}%")
+    st.markdown("**하락과 상승은 대칭이 아닙니다.** 50% 하락했을 때 원금을 찾으려면 100% 상승(두 배)해야 하며, 80% 하락하면 400% 상승해야 원금으로 복구됩니다. 손실이 깊어질수록 회복을 위해 요구되는 노력은 기하급수적으로 증가합니다.")
+
+    # 3-5. 핵심 메시지 자동 출력
+    st.subheader("실제 데이터를 통한 레버리지 성과 점검")
+    
+    qqq_ret = calc_total_return(lev_prices["QQQ"])
+    tqqq_ret = calc_total_return(lev_prices["TQQQ"])
+    tqqq_mdd = calc_mdd(lev_prices["TQQQ"])
+    
+    years_elapsed = total_days / 365.25
+
+    # 구간에 따라 3배를 넘을 수도, 1배보다 못할 수도 있다.
+    # 결과에 맞는 문장을 골라야 한다. 한 가지 문장으로 고정하면 설명이 데이터와 어긋난다.
+    if qqq_ret <= 0:
+        verdict = (
+            f"이 구간은 QQQ(1배) 자체가 {qqq_ret*100:+.1f}%로 손실이어서 "
+            f"배수 비교가 성립하지 않습니다."
         )
-        st.write(
-            f"2. **QQQ와 TQQQ의 상관계수는 {qqq_tqqq:.2f}입니다.**\n"
-            f"   배수만 다를 뿐 매일 같은 방향으로 움직이는 사실상 동일한 자산입니다."
-        )
-        st.write(
-            f"3. **GLD(금)와 주식(SPY {gld_spy:.2f}, SCHD {gld_schd:.2f})은 상관이 매우 낮습니다.**\n"
-            f"   움직임이 다른 자산을 섞을 때 실질적인 분산투자 효과가 발생합니다."
-        )
+    else:
+        mult = tqqq_ret / qqq_ret
+        if mult < 1:
+            verdict = (
+                f"추종 배수는 3배이지만 실제 {years_elapsed:.1f}년 성과는 "
+                f"1배인 QQQ보다도 낮았습니다."
+            )
+        elif mult < 3:
+            verdict = (
+                f"추종 배수는 3배이지만 실제 {years_elapsed:.1f}년 성과의 차이는 "
+                f"{mult:.1f}배에 그쳤습니다."
+            )
+        else:
+            verdict = (
+                f"이 구간은 상승이 이어져 {years_elapsed:.1f}년 성과의 차이가 "
+                f"{mult:.1f}배로 3배를 넘었습니다. 레버리지가 유리하게 작용한 구간입니다."
+            )
 
-    st.markdown("---")
-
-    # 5-3. 두 자산 배분 실험 (SPY + GLD)
-    st.subheader("2. 두 자산 배분 실험 (SPY + GLD)")
-    st.caption("가정: 매일 비중을 다시 맞춘다는 일일 리밸런싱 가정 하에 계산합니다.")
-
-    spy_weight = st.slider("SPY(주식) 비중 (%)", min_value=0, max_value=100, value=50, step=5)
-    gld_weight = 100 - spy_weight
-
-    # 포트폴리오 시계열 및 지표 계산
-    first_date = filtered_df.index[0]
-    port_series = calc_portfolio_series(daily_ret, spy_weight, first_date)
-    port_m = calc_metrics(port_series, start_dt, end_dt)
-
-    # SPY 100% 기준 지표
-    spy_m = calc_metrics(filtered_df["SPY"], start_dt, end_dt)
-
-    # 3개 메트릭 표시 (SPY 100% 대비 차이)
-    col_m1, col_m2, col_m3 = st.columns(3)
-
-    delta_tr = (port_m["total_return"] - spy_m["total_return"]) * 100.0
-    delta_vol = (port_m["volatility"] - spy_m["volatility"]) * 100.0
-    delta_mdd = (port_m["mdd"] - spy_m["mdd"]) * 100.0
-
-    with col_m1:
-        st.metric(
-            label=f"포트폴리오 총수익률 (SPY {spy_weight}% / GLD {gld_weight}%)",
-            value=f"{port_m['total_return'] * 100:+.1f}%",
-            delta=f"{delta_tr:+.1f}%p (SPY 100% 대비)"
-        )
-    with col_m2:
-        st.metric(
-            label="연변동성 (위험도)",
-            value=f"{port_m['volatility'] * 100:.1f}%",
-            delta=f"{delta_vol:+.1f}%p (SPY 100% 대비)",
-            delta_color="inverse"
-        )
-    with col_m3:
-        st.metric(
-            label="최대낙폭 (MDD)",
-            value=f"{port_m['mdd'] * 100:.1f}%",
-            delta=f"{delta_mdd:+.1f}%p (SPY 100% 대비)",
-            delta_color="normal"
-        )
-
-    st.markdown("---")
-
-    # 5-4. 비중별 위험-수익 산점도 & 5-5. 자산군 성과 비교 (2단 컬럼)
-    col_scatter, col_assets = st.columns(2)
-
-    with col_scatter:
-        st.subheader("비중별 위험-수익 산점도")
-        st.caption("SPY 비중을 0%부터 100%까지 10% 간격으로 배치한 결과입니다.")
-
-        scatter_points = []
-        for w in range(0, 101, 10):
-            p_s = calc_portfolio_series(daily_ret, float(w), first_date)
-            pm = calc_metrics(p_s, start_dt, end_dt)
-            scatter_points.append({
-                "비중": f"SPY {w}%",
-                "연변동성": pm["volatility"] * 100.0,
-                "총수익률": pm["total_return"] * 100.0,
-                "spy_w": w
-            })
-        scatter_df = pd.DataFrame(scatter_points)
-
-        # 현재 슬라이더로 선택된 비중의 수치
-        cur_vol = port_m["volatility"] * 100.0
-        cur_tr = port_m["total_return"] * 100.0
-
-        fig_sc = go.Figure()
-
-        # 10% 단위 기본 포인트들
-        fig_sc.add_trace(go.Scatter(
-            x=scatter_df["연변동성"],
-            y=scatter_df["총수익률"],
-            mode="markers+text",
-            text=scatter_df["비중"],
-            textposition="top center",
-            marker=dict(size=9, color="#1f77b4"),
-            name="10% 단위 비중"
-        ))
-
-        # 현재 선택된 비중 포인트 강조
-        fig_sc.add_trace(go.Scatter(
-            x=[cur_vol],
-            y=[cur_tr],
-            mode="markers+text",
-            text=[f"선택: SPY {spy_weight}%"],
-            textposition="bottom center",
-            marker=dict(size=14, color="#d62728", symbol="diamond"),
-            name="선택된 비중"
-        ))
-
-        fig_sc.update_layout(
-            xaxis_title="연변동성 (%)",
-            yaxis_title="총수익률 (%)",
-            margin=dict(l=20, r=20, t=30, b=20),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-        )
-        st.plotly_chart(fig_sc, use_container_width=True)
-
-        st.info(
-            "이 그래프의 가장 왼쪽(최저 변동성 지점)은 주식 100%도 금 100%도 아닌 두 자산을 섞은 구간입니다. "
-            "각각의 자산보다 적절히 섞은 포트폴리오가 덜 흔들립니다."
-        )
-
-    with col_assets:
-        st.subheader("주요 자산군 누적 성과 비교")
-        st.caption("SPY (미국 대형주), GLD (금 현물), SCHD (미국 배당성장)")
-
-        asset_symbols = ["SPY", "GLD", "SCHD"]
-        norm_asset_df = (filtered_df[asset_symbols] / filtered_df[asset_symbols].iloc[0]) * 100.0
-
-        fig_assets = px.line(
-            norm_asset_df,
-            x=norm_asset_df.index,
-            y=asset_symbols,
-            labels={"datetime": "날짜", "value": "정규화 가격 (첫날=100)", "symbol": "종목"},
-            color_discrete_map={"SPY": "#1f77b4", "GLD": "#bcbd22", "SCHD": "#2ca02c"}
-        )
-        fig_assets.update_layout(
-            hovermode="x unified",
-            margin=dict(l=20, r=20, t=30, b=20),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-        )
-        st.plotly_chart(fig_assets, use_container_width=True)
-
-        st.caption("주: SCHD는 배당이 제외된 종가 기준이므로 실제 성과보다 과소평가되어 있습니다.")
-
-
-# ==============================================================================
-# 6. 메인 실행 함수
-# ==============================================================================
-
-def main():
-    st.set_page_config(
-        page_title="미국 ETF 성과 및 분산투자 대시보드",
-        layout="wide"
+    message_text = (
+        f"{start_date} ~ {end_date} 구간에서 TQQQ(3배)는 {tqqq_ret*100:+.1f}%, QQQ(1배)는 {qqq_ret*100:+.1f}%였습니다. "
+        f"{verdict} "
+        f"다만 이 구간에서 TQQQ의 최대낙폭(MDD)은 {tqqq_mdd*100:.1f}%였습니다."
     )
+    st.info(message_text)
+    
+    st.markdown("""
+    **시작일을 변경해 보십시오**  
+    사이드바의 분석 시작일을 **2023-01-03**으로 바꾸면 레버리지 수익률이 기하급수적으로 폭발하는 것을 볼 수 있고, 
+    반대로 **2022-01-03**으로 바꾸면 1배(QQQ) 자산이 우수한 성과를 내며 3배 레버리지는 손실이 극대화되는 모습을 확인할 수 있습니다.
+    이는 일간 변동률 기준 배수의 누적 복리 효과가 상승장과 횡보장/하락장에서 다르게 작용하는 **레버리지 침식(Decay) 현상**을 실제 증명합니다.
+    """)
 
-    st.title("미국 ETF 성과 및 분산투자 대시보드")
+# ==========================================
+# 4. 탭 2 — 분산투자의 힘
+# ==========================================
+with tab2:
+    st.header("자산 분산을 통한 변동성 및 위험 감소 분석")
+    
+    # 4-5. 자산군 성과 비교 (SPY, GLD, SCHD)
+    st.subheader("주요 자산군 누적 성과 비교 (SPY: 주식, GLD: 금, SCHD: 배당성장)")
+    comp_symbols = ["SPY", "GLD", "SCHD"]
+    comp_prices = sliced_prices[comp_symbols]
+    norm_comp_prices = (comp_prices / comp_prices.iloc[0]) * 100
+    
+    fig_comp = px.line(
+        norm_comp_prices, 
+        x=norm_comp_prices.index, 
+        y=comp_symbols,
+        labels={"value": "정규화 가격 (Base 100)", "datetime": "날짜"}
+    )
+    fig_comp.update_layout(legend_title_text="자산군", margin=dict(l=20, r=20, t=20, b=20))
+    st.plotly_chart(fig_comp, width='stretch')
+    st.caption("주의: SCHD는 배당이 미포함된 종가 가격 기준 성과이므로 분배금을 포함한 실질 누적 수익률 대비 과소평가되어 있습니다.")
 
-    # 데이터 로드
-    pivot_df = load_data()
+    # 4-1. 상관계수 히트맵
+    st.subheader("7개 종목 간 일간수익률 상관계수 행렬 (Correlation Matrix)")
+    daily_returns = sliced_prices.pct_change().dropna()
+    corr_matrix = daily_returns.corr()
+    
+    fig_corr = px.imshow(
+        corr_matrix,
+        text_auto=".2f",
+        aspect="auto",
+        zmin=-1.0,
+        zmax=1.0,
+        color_continuous_scale="RdBu_r",
+        labels=dict(color="상관계수")
+    )
+    st.plotly_chart(fig_corr, width='stretch')
+    
+    # 4-2. 히트맵 해석 문장
+    spy_vti_corr = corr_matrix.loc["SPY", "VTI"]
+    qqq_tqqq_corr = corr_matrix.loc["QQQ", "TQQQ"]
+    gld_spy_corr = corr_matrix.loc["GLD", "SPY"]
+    gld_schd_corr = corr_matrix.loc["GLD", "SCHD"]
+    
+    st.markdown(f"""
+    * **SPY와 VTI의 상관계수 ({spy_vti_corr:.2f})**: 두 자산은 상관계수가 1에 극도로 가깝습니다. 이는 두 종목을 분산하여 포트폴리오에 보유하는 것이 실질적인 분산투자 및 변동성 감소 효과를 내지 못함을 뜻합니다.
+    * **QQQ, QLD, TQQQ의 상관계수 ({qqq_tqqq_corr:.2f})**: 레버리지 배수만 다를 뿐 매일 완전히 비례해 움직이므로 위험 분산의 관점에서는 완전히 동일한 단일 자산입니다.
+    * **금(GLD)과 주식/배당성장 자산의 상관계수 (SPY: {gld_spy_corr:.2f}, SCHD: {gld_schd_corr:.2f})**: 금 현물은 미국 주식형 지수와 매우 낮은 상관관계를 형성합니다. 이처럼 상관계수가 낮은 상이한 자산군을 배분할 때 진정한 위험 대비 분산 투자 성과 개선이 이루어집니다.
+    """)
 
-    # 사이드바 렌더링
-    filtered_df, start_date, end_date = render_sidebar(pivot_df)
+    # 4-3. 두 자산 배분 실험 (SPY & GLD)
+    st.subheader("두 자산 배분 포트폴리오 시뮬레이션 (SPY & GLD)")
+    st.markdown("매일 자산 비중을 정해진 비율로 강제 재조정(Daily Rebalancing)하는 가상의 자산 배분 포트폴리오를 시뮬레이션합니다.")
+    
+    spy_weight = st.slider("주식(SPY) 비중 (%)", min_value=0, max_value=100, value=50, step=5, key="spy_w_slider")
+    gld_weight = 100 - spy_weight
+    
+    # 포트폴리오 일간수익률 산출
+    w_spy = spy_weight / 100.0
+    w_gld = gld_weight / 100.0
+    
+    p_daily_ret = (w_spy * daily_returns["SPY"]) + (w_gld * daily_returns["GLD"])
+    # 가상의 가격 인덱스 복원 (100 시작 기준)
+    p_prices = pd.Series(100.0, index=sliced_prices.index)
+    p_prices.iloc[1:] = 100.0 * (1.0 + p_daily_ret).cumprod()
+    
+    # SPY 100% 단일 자산 기준치 계산 (대조군용)
+    spy_prices = sliced_prices["SPY"]
+    ref_spy_tot = calc_total_return(spy_prices)
+    ref_spy_vol = calc_volatility(spy_prices)
+    ref_spy_mdd = calc_mdd(spy_prices)
+    
+    # 포트폴리오 분석 결과 산출
+    port_tot = calc_total_return(p_prices)
+    port_vol = calc_volatility(p_prices)
+    port_mdd = calc_mdd(p_prices)
+    
+    # 대조 편차 계산
+    diff_tot = port_tot - ref_spy_tot
+    diff_vol = port_vol - ref_spy_vol
+    diff_mdd = port_mdd - ref_spy_mdd
+    
+    m_col1, m_col2, m_col3 = st.columns(3)
+    
+    with m_col1:
+        st.metric(
+            label="포트폴리오 총수익률", 
+            value=f"{port_tot*100:.1f}%", 
+            delta=f"{diff_tot*100:+.1f}%p (vs SPY 100%)"
+        )
+    with m_col2:
+        st.metric(
+            label="포트폴리오 연변동성", 
+            value=f"{port_vol*100:.1f}%", 
+            delta=f"{diff_vol*100:+.1f}%p (vs SPY 100%)",
+            delta_color="inverse" # 변동성은 낮아지는 것이 양호(초록색)
+        )
+    with m_col3:
+        st.metric(
+            label="포트폴리오 최대낙폭(MDD)", 
+            value=f"{port_mdd*100:.1f}%", 
+            delta=f"{diff_mdd*100:+.1f}%p (vs SPY 100%)",
+            delta_color="off"
+        )
 
-    start_dt = pd.to_datetime(start_date)
-    end_dt = pd.to_datetime(end_date)
+    # 4-4. 비중별 위험-수익 산점도 시뮬레이션
+    st.subheader("자산 비중에 따른 위험-수익 관계 산점도 (Efficient Frontier)")
+    
+    scatter_data = []
+    for w in range(0, 101, 10):
+        w_s = w / 100.0
+        w_g = 1.0 - w_s
+        temp_ret = (w_s * daily_returns["SPY"]) + (w_g * daily_returns["GLD"])
+        temp_prices = pd.Series(100.0, index=sliced_prices.index)
+        temp_prices.iloc[1:] = 100.0 * (1.0 + temp_ret).cumprod()
+        
+        tot = calc_total_return(temp_prices)
+        vol = calc_volatility(temp_prices)
+        
+        scatter_data.append({
+            "SPY_weight": w,
+            "총수익률": tot * 100,
+            "연변동성": vol * 100,
+            "label": f"SPY {w}% / GLD {100-w}%"
+        })
+        
+    scatter_df = pd.DataFrame(scatter_data)
+    
+    # 차트 그리기
+    fig_scatter = go.Figure()
+    
+    # 11개 일반 시뮬레이션 점 플로팅
+    fig_scatter.add_trace(go.Scatter(
+        x=scatter_df["연변동성"],
+        y=scatter_df["총수익률"],
+        mode="markers+text",
+        text=scatter_df["SPY_weight"].apply(lambda w: f"SPY {w}%"),
+        textposition="top center",
+        marker=dict(size=10, color="blue", opacity=0.6),
+        name="비중별 조합"
+    ))
+    
+    # 사용자가 선택한 현재 비중 지점 강조
+    fig_scatter.add_trace(go.Scatter(
+        x=[port_vol * 100],
+        y=[port_tot * 100],
+        mode="markers",
+        marker=dict(size=16, color="red", line=dict(width=2, color="black")),
+        name="현재 선택 지점"
+    ))
+    
+    fig_scatter.update_layout(
+        xaxis_title="연변동성 (%)",
+        yaxis_title="총수익률 (%)",
+        margin=dict(l=20, r=20, t=20, b=20),
+        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
+    )
+    
+    st.plotly_chart(fig_scatter, width='stretch')
+    
+    # 최저 변동성 조합을 실제로 계산해서 문장을 만든다.
+    # 숫자를 코드에 고정하면 사용자가 기간을 바꿨을 때 설명이 틀리게 된다.
+    min_vol_row = scatter_df.loc[scatter_df["연변동성"].idxmin()]
+    gld_only = scatter_df.iloc[0]   # SPY 0%  = 금 100%
+    spy_only = scatter_df.iloc[-1]  # SPY 100% = 주식 100%
 
-    # 탭 구성
-    tab1, tab2 = st.tabs(["레버리지의 함정", "분산투자의 힘"])
+    st.markdown(f"""
+    **산점도를 통해 깨닫는 자산배분의 본질**
 
-    with tab1:
-        render_tab1_leverage(filtered_df, start_dt, end_dt)
+    이 구간에서 연변동성이 가장 낮은 조합은 주식 100%도 금 100%도 아닌
+    **SPY {min_vol_row["SPY_weight"]:.0f}% / GLD {100 - min_vol_row["SPY_weight"]:.0f}%** 였습니다
+    (연변동성 {min_vol_row["연변동성"]:.1f}%).
+    각각 단독으로 보유했을 때의 연변동성은 SPY {spy_only["연변동성"]:.1f}%,
+    GLD {gld_only["연변동성"]:.1f}% 로 둘 다 이보다 높았습니다.
 
-    with tab2:
-        render_tab2_diversification(filtered_df, start_dt, end_dt)
-
-
-if __name__ == "__main__":
-    main()
+    상관관계가 낮은 자산을 함께 담으면 각 자산의 고유 위험이 서로 상쇄됩니다.
+    그래서 섞은 쪽이 개별 자산 각각보다 덜 흔들립니다.
+    """)
